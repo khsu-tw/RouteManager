@@ -32,31 +32,108 @@ def timestamp():
 def get_network_adapters():
     """取得所有網路介面卡資訊"""
     adapters = []
-    ps_cmd = '''
-    Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null } | ForEach-Object {
-        [PSCustomObject]@{
-            Name = $_.InterfaceAlias
-            IP = $_.IPv4Address.IPAddress
-            Gateway = $_.IPv4DefaultGateway.NextHop
-        }
-    } | ConvertTo-Json
-    '''
-    result = subprocess.run(
-        ["powershell", "-Command", ps_cmd],
-        capture_output=True, text=True, encoding='utf-8', errors='ignore'
-    )
-    try:
-        data = json.loads(result.stdout)
-        if isinstance(data, dict):
-            data = [data]
-        for item in data:
-            adapters.append({
-                'name': item['Name'],
-                'ip': item['IP'],
-                'gateway': item['Gateway']
-            })
-    except:
-        pass
+
+    if sys.platform == 'win32':
+        # Windows: 使用 PowerShell
+        ps_cmd = '''
+        Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null } | ForEach-Object {
+            [PSCustomObject]@{
+                Name = $_.InterfaceAlias
+                IP = $_.IPv4Address.IPAddress
+                Gateway = $_.IPv4DefaultGateway.NextHop
+            }
+        } | ConvertTo-Json
+        '''
+        result = subprocess.run(
+            ["powershell", "-Command", ps_cmd],
+            capture_output=True, text=True, encoding='utf-8', errors='ignore'
+        )
+        try:
+            data = json.loads(result.stdout)
+            if isinstance(data, dict):
+                data = [data]
+            for item in data:
+                adapters.append({
+                    'name': item['Name'],
+                    'ip': item['IP'],
+                    'gateway': item['Gateway']
+                })
+        except:
+            pass
+
+    elif sys.platform == 'darwin':
+        # macOS: 使用 networksetup 和 ifconfig
+        try:
+            # 取得所有網路服務
+            result = subprocess.run(
+                ["networksetup", "-listallnetworkservices"],
+                capture_output=True, text=True
+            )
+            services = [line for line in result.stdout.strip().split('\n')
+                       if line and not line.startswith('*')]
+
+            for service in services:
+                # 取得該服務的網路介面名稱
+                result = subprocess.run(
+                    ["networksetup", "-getinfo", service],
+                    capture_output=True, text=True
+                )
+                info = result.stdout
+
+                # 解析 IP 和 Gateway
+                ip = None
+                gateway = None
+                for line in info.split('\n'):
+                    if line.startswith('IP address:'):
+                        ip = line.split(':')[1].strip()
+                    elif line.startswith('Router:'):
+                        gw = line.split(':')[1].strip()
+                        if gw and gw != 'none':
+                            gateway = gw
+
+                # 只加入有 IP 和 Gateway 的介面
+                if ip and gateway and ip != 'none':
+                    adapters.append({
+                        'name': service,
+                        'ip': ip,
+                        'gateway': gateway
+                    })
+        except:
+            pass
+
+    else:
+        # Linux: 使用 ip 命令
+        try:
+            # 取得預設路由的介面
+            result = subprocess.run(
+                ["ip", "route", "show", "default"],
+                capture_output=True, text=True
+            )
+
+            # 解析每個預設路由
+            for line in result.stdout.strip().split('\n'):
+                if 'default via' in line:
+                    parts = line.split()
+                    gateway = parts[2]
+                    iface = parts[4]
+
+                    # 取得該介面的 IP
+                    result2 = subprocess.run(
+                        ["ip", "-4", "addr", "show", iface],
+                        capture_output=True, text=True
+                    )
+                    for addr_line in result2.stdout.split('\n'):
+                        if 'inet ' in addr_line:
+                            ip = addr_line.strip().split()[1].split('/')[0]
+                            adapters.append({
+                                'name': iface,
+                                'ip': ip,
+                                'gateway': gateway
+                            })
+                            break
+        except:
+            pass
+
     return adapters
 
 

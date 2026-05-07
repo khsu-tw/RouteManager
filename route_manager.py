@@ -1,10 +1,10 @@
 """
-RouteManager - 以 Windows 路由表方式，讓特定 IP 走指定網卡
+RouteManager - 以路由表方式，讓特定 IP 走指定網卡
 不使用 Proxy，OS 層級直接分流，Outlook/Teams 等程式完全不受影響
-需以「系統管理員」身分執行
+Windows 需以「系統管理員」身分執行
+macOS/Linux 需以 sudo 執行
 """
 
-import ctypes
 import json
 import os
 import subprocess
@@ -14,6 +14,7 @@ from pathlib import Path
 
 # 修復 Windows 終端機編碼
 if sys.platform == 'win32':
+    import ctypes
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
     os.system('chcp 65001 > nul 2>&1')
@@ -26,15 +27,20 @@ def timestamp():
 
 
 def is_admin():
-    """檢查是否以系統管理員身分執行"""
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin() != 0
-    except:
-        return False
+    """檢查是否有管理員/root 權限"""
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except:
+            return False
+    else:
+        # macOS/Linux: 檢查是否為 root
+        return os.geteuid() == 0
 
 
 def run_ps(ps_cmd):
-    """執行 PowerShell 命令並回傳 stdout"""
+    """執行 PowerShell 命令並回傳 stdout (Windows only)"""
     result = subprocess.run(
         ["powershell", "-NoProfile", "-Command", ps_cmd],
         capture_output=True, text=True, encoding='utf-8', errors='ignore'
@@ -43,31 +49,118 @@ def run_ps(ps_cmd):
 
 
 def get_network_adapters():
-    """取得所有具 Gateway 的網卡 (包含 InterfaceIndex)"""
+    """取得所有具 Gateway 的網卡"""
     adapters = []
-    ps_cmd = '''
-    Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null } | ForEach-Object {
-        [PSCustomObject]@{
-            Name = $_.InterfaceAlias
-            Index = $_.InterfaceIndex
-            IP = $_.IPv4Address.IPAddress
-            Gateway = $_.IPv4DefaultGateway.NextHop
-        }
-    } | ConvertTo-Json
-    '''
-    try:
-        data = json.loads(run_ps(ps_cmd))
-        if isinstance(data, dict):
-            data = [data]
-        for item in data:
-            adapters.append({
-                'name': item['Name'],
-                'index': int(item['Index']),
-                'ip': item['IP'],
-                'gateway': item['Gateway']
-            })
-    except:
-        pass
+
+    if sys.platform == 'win32':
+        # Windows: 使用 PowerShell
+        ps_cmd = '''
+        Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null } | ForEach-Object {
+            [PSCustomObject]@{
+                Name = $_.InterfaceAlias
+                Index = $_.InterfaceIndex
+                IP = $_.IPv4Address.IPAddress
+                Gateway = $_.IPv4DefaultGateway.NextHop
+            }
+        } | ConvertTo-Json
+        '''
+        try:
+            data = json.loads(run_ps(ps_cmd))
+            if isinstance(data, dict):
+                data = [data]
+            for item in data:
+                adapters.append({
+                    'name': item['Name'],
+                    'index': int(item['Index']),
+                    'ip': item['IP'],
+                    'gateway': item['Gateway']
+                })
+        except:
+            pass
+
+    elif sys.platform == 'darwin':
+        # macOS: 使用 networksetup
+        try:
+            result = subprocess.run(
+                ["networksetup", "-listallnetworkservices"],
+                capture_output=True, text=True
+            )
+            services = [line for line in result.stdout.strip().split('\n')
+                       if line and not line.startswith('*')]
+
+            for service in services:
+                # 取得網路介面名稱 (en0, en1, etc.)
+                result = subprocess.run(
+                    ["networksetup", "-listallhardwareports"],
+                    capture_output=True, text=True
+                )
+                interface = None
+                lines = result.stdout.split('\n')
+                for i, line in enumerate(lines):
+                    if service in line:
+                        for j in range(i+1, min(i+3, len(lines))):
+                            if lines[j].startswith('Device:'):
+                                interface = lines[j].split(':')[1].strip()
+                                break
+                        break
+
+                # 取得 IP 和 Gateway
+                result = subprocess.run(
+                    ["networksetup", "-getinfo", service],
+                    capture_output=True, text=True
+                )
+                info = result.stdout
+                ip = None
+                gateway = None
+
+                for line in info.split('\n'):
+                    if line.startswith('IP address:'):
+                        ip = line.split(':')[1].strip()
+                    elif line.startswith('Router:'):
+                        gw = line.split(':')[1].strip()
+                        if gw and gw != 'none':
+                            gateway = gw
+
+                if ip and gateway and ip != 'none' and interface:
+                    adapters.append({
+                        'name': service,
+                        'index': interface,  # macOS 用 interface name
+                        'ip': ip,
+                        'gateway': gateway
+                    })
+        except:
+            pass
+
+    else:
+        # Linux: 使用 ip 命令
+        try:
+            result = subprocess.run(
+                ["ip", "route", "show", "default"],
+                capture_output=True, text=True
+            )
+            for line in result.stdout.strip().split('\n'):
+                if 'default via' in line:
+                    parts = line.split()
+                    gateway = parts[2]
+                    iface = parts[4]
+
+                    result2 = subprocess.run(
+                        ["ip", "-4", "addr", "show", iface],
+                        capture_output=True, text=True
+                    )
+                    for addr_line in result2.stdout.split('\n'):
+                        if 'inet ' in addr_line:
+                            ip = addr_line.strip().split()[1].split('/')[0]
+                            adapters.append({
+                                'name': iface,
+                                'index': iface,
+                                'ip': ip,
+                                'gateway': gateway
+                            })
+                            break
+        except:
+            pass
+
     return adapters
 
 
@@ -94,45 +187,105 @@ def save_config(config):
 
 def route_exists(ip):
     """檢查路由表中是否已有此 IP (/32) 的路由"""
-    result = subprocess.run(
-        ["route", "print", ip],
-        capture_output=True, text=True, encoding='utf-8', errors='ignore'
-    )
-    # 如果路由存在，輸出會包含該 IP + mask 255.255.255.255
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 2 and parts[0] == ip and parts[1] == "255.255.255.255":
-            return True
-    return False
+    if sys.platform == 'win32':
+        result = subprocess.run(
+            ["route", "print", ip],
+            capture_output=True, text=True, encoding='utf-8', errors='ignore'
+        )
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == ip and parts[1] == "255.255.255.255":
+                return True
+        return False
+
+    elif sys.platform == 'darwin':
+        # macOS: route -n get <ip>
+        result = subprocess.run(
+            ["route", "-n", "get", ip],
+            capture_output=True, text=True
+        )
+        # 如果是 host route，會顯示 "destination: <ip>"
+        return result.returncode == 0 and ip in result.stdout
+
+    else:
+        # Linux: ip route show <ip>
+        result = subprocess.run(
+            ["ip", "route", "show", ip],
+            capture_output=True, text=True
+        )
+        return bool(result.stdout.strip())
 
 
 def add_route(ip, adapter, persistent=False):
-    """新增一條 Host Route (mask 255.255.255.255) 指向指定網卡"""
-    # 先清掉舊的 (避免有殘留指向其他 gateway)
+    """新增一條 Host Route 指向指定網卡"""
+    # 先清掉舊的
     if route_exists(ip):
-        subprocess.run(["route", "delete", ip],
-                       capture_output=True, text=True)
+        delete_route(ip)
 
-    cmd = ["route"]
-    if persistent:
-        cmd.append("-p")
-    cmd += ["add", ip, "mask", "255.255.255.255",
-            adapter['gateway'],
-            "metric", "1",
-            "if", str(adapter['index'])]
+    if sys.platform == 'win32':
+        cmd = ["route"]
+        if persistent:
+            cmd.append("-p")
+        cmd += ["add", ip, "mask", "255.255.255.255",
+                adapter['gateway'],
+                "metric", "1",
+                "if", str(adapter['index'])]
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                encoding='utf-8', errors='ignore')
+        ok = result.returncode == 0 and "OK" in (result.stdout or "").upper()
+        return ok, (result.stdout or "") + (result.stderr or "")
 
-    result = subprocess.run(cmd, capture_output=True, text=True,
-                            encoding='utf-8', errors='ignore')
-    ok = result.returncode == 0 and "OK" in (result.stdout or "").upper()
-    return ok, (result.stdout or "") + (result.stderr or "")
+    elif sys.platform == 'darwin':
+        # macOS: route add -host <ip> -interface <interface>
+        # 或 route add -host <ip> <gateway>
+        cmd = ["route", "add", "-host", ip, adapter['gateway']]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        ok = result.returncode == 0 or "add host" in (result.stdout or "").lower()
+        msg = (result.stdout or "") + (result.stderr or "")
+
+        # macOS 沒有內建 persistent route，需寫入 launchd plist
+        if persistent and ok:
+            msg += " (Note: macOS persistent routes need manual launchd setup)"
+
+        return ok, msg
+
+    else:
+        # Linux: ip route add <ip> via <gateway> dev <interface>
+        cmd = ["ip", "route", "add", ip, "via", adapter['gateway'], "dev", adapter['index']]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        ok = result.returncode == 0
+        msg = (result.stdout or "") + (result.stderr or "")
+
+        if persistent and ok:
+            msg += " (Note: Linux persistent routes need /etc/network/interfaces or netplan)"
+
+        return ok, msg
 
 
 def delete_route(ip):
-    result = subprocess.run(
-        ["route", "delete", ip],
-        capture_output=True, text=True, encoding='utf-8', errors='ignore'
-    )
-    return result.returncode == 0, (result.stdout or "") + (result.stderr or "")
+    """刪除路由"""
+    if sys.platform == 'win32':
+        result = subprocess.run(
+            ["route", "delete", ip],
+            capture_output=True, text=True, encoding='utf-8', errors='ignore'
+        )
+        return result.returncode == 0, (result.stdout or "") + (result.stderr or "")
+
+    elif sys.platform == 'darwin':
+        # macOS
+        result = subprocess.run(
+            ["route", "delete", "-host", ip],
+            capture_output=True, text=True
+        )
+        return result.returncode == 0, (result.stdout or "") + (result.stderr or "")
+
+    else:
+        # Linux
+        result = subprocess.run(
+            ["ip", "route", "del", ip],
+            capture_output=True, text=True
+        )
+        return result.returncode == 0, (result.stdout or "") + (result.stderr or "")
 
 
 def apply_all_routes(config):
@@ -194,13 +347,18 @@ def test_route(config):
     if not ip:
         return
 
-    print(f"\n--- tracert -h 2 {ip} ---")
-    subprocess.run(["tracert", "-h", "2", "-w", "2000", ip])
+    if sys.platform == 'win32':
+        print(f"\n--- tracert -h 2 {ip} ---")
+        subprocess.run(["tracert", "-h", "2", "-w", "2000", ip])
+    else:
+        # macOS/Linux 用 traceroute
+        print(f"\n--- traceroute -m 2 {ip} ---")
+        subprocess.run(["traceroute", "-m", "2", "-w", "2", ip])
 
-    print(f"\n--- pathping candidate adapter ---")
+    print(f"\n--- Expected gateway ---")
     adapter = config.get('hotspot_adapter')
     if adapter:
-        print(f"Expected gateway if routed via hotspot: {adapter['gateway']}")
+        print(f"If routed via hotspot: {adapter['gateway']}")
 
     input("\nPress Enter to continue...")
 
@@ -317,8 +475,12 @@ def main():
     print("="*50)
 
     if not is_admin():
-        print("\n[!] This tool requires Administrator privileges")
-        print("    Please right-click and 'Run as administrator'")
+        if sys.platform == 'win32':
+            print("\n[!] This tool requires Administrator privileges")
+            print("    Please right-click and 'Run as administrator'")
+        else:
+            print("\n[!] This tool requires root privileges")
+            print("    Please run with: sudo python3 route_manager.py")
         input("\nPress Enter to exit...")
         return
 
