@@ -1,9 +1,9 @@
 {
   "hotspot_adapter": {
     "name": "Wi-Fi",
-    "index": 3,
-    "ip": "192.168.0.104",
-    "gateway": "192.168.0.1"
+    "index": 16,
+    "ip": "172.20.10.2",
+    "gateway": "172.20.10.1"
   },
   "routes": [
     "1.34.56.127"
